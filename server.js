@@ -95,9 +95,19 @@ function getApp(nationalId) {
   return db.applications.get(nationalId);
 }
 
+function generateAdminToken() {
+  return crypto.createHmac('sha256', ADMIN_PASS_HASH).update('admin-session-valid').digest('hex');
+}
+
 function checkAdmin(cookies) {
   const token = cookies?.admin_token;
-  return token && db.adminSession?.token === token;
+  if (!token) return false;
+  const expected = generateAdminToken();
+  try {
+    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }
 
 const procedures = {
@@ -200,8 +210,7 @@ const procedures = {
     const passMatch = crypto.timingSafeEqual(Buffer.from(inputPassHash, 'hex'), Buffer.from(ADMIN_PASS_HASH, 'hex'));
     if (userMatch && passMatch) {
       clearAttempts(ip);
-      const token = crypto.randomBytes(32).toString('hex');
-      db.adminSession = { token, isAdmin: true };
+      const token = generateAdminToken();
       ctx.setCookie = { name: 'admin_token', value: token };
       return { success: true, isAdmin: true };
     }
@@ -210,7 +219,6 @@ const procedures = {
   },
 
   'admin.logout': (_input, ctx) => {
-    db.adminSession = null;
     ctx.clearCookie = 'admin_token';
     return { success: true };
   },
