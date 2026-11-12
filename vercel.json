@@ -14,7 +14,7 @@
     { "src": "/api/(.*)", "dest": "/api/index.js" },
     { "src": "/assets/(.*)", "dest": "/public/assets/$1" },
     { "src": "/manus-storage/(.*)", "dest": "/public/manus-storage/$1" },
-    { "src": "/(.*\.(js|css|png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot))", "dest": "/public/$1" },
+    { "src": "/(.*\\.(js|css|png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot))", "dest": "/public/$1" },
     { "src": "/(.*)", "dest": "/public/index.html" }
   ]
 }
