@@ -344,16 +344,17 @@ const procedures = {
 
   'admin.getAllVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    return await dbGetAll('visitors');
+    return { visitors: await dbGetAll('visitors') };
   },
 
   'admin.getLiveVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     const now = Date.now();
     const all = await dbGetAll('visitors');
-    return all
+    const live = all
       .filter(v => now - v.lastSeen < 60000)
       .map(v => ({ sessionId: v.sessionId, currentPage: v.currentPage, lastSeen: v.lastSeen }));
+    return { visitors: live };
   },
 
   'admin.updateVisitor': async (input) => {
