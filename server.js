@@ -33,6 +33,28 @@ const db = {
 const ADMIN_USER = process.env.ADMIN_USER || '61646d696e';
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH || 'ac0e7d037817094e9e0b4441f9bae3209d67b02fa484917065f71b16109a1a78';
 
+const TOKEN_SECRET = process.env.TOKEN_SECRET || ADMIN_PASS_HASH;
+
+function signToken() {
+  const ts = Date.now().toString();
+  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(ts).digest('hex');
+  return ts + '.' + sig;
+}
+
+function verifyToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const dot = token.indexOf('.');
+  if (dot < 1) return false;
+  const ts = token.substring(0, dot);
+  const sig = token.substring(dot + 1);
+  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(ts).digest('hex');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) return false;
+  } catch { return false; }
+  const age = Date.now() - Number(ts);
+  return age >= 0 && age < 86400000;
+}
+
 function resolveAdminUser() {
   if (process.env.ADMIN_USER) return process.env.ADMIN_USER;
   return Buffer.from(ADMIN_USER, 'hex').toString('utf8');
@@ -95,19 +117,9 @@ function getApp(nationalId) {
   return db.applications.get(nationalId);
 }
 
-function generateAdminToken() {
-  return crypto.createHmac('sha256', ADMIN_PASS_HASH).update('admin-session-valid').digest('hex');
-}
-
 function checkAdmin(cookies) {
   const token = cookies?.admin_token;
-  if (!token) return false;
-  const expected = generateAdminToken();
-  try {
-    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
-  } catch {
-    return false;
-  }
+  return verifyToken(token);
 }
 
 const procedures = {
@@ -210,7 +222,7 @@ const procedures = {
     const passMatch = crypto.timingSafeEqual(Buffer.from(inputPassHash, 'hex'), Buffer.from(ADMIN_PASS_HASH, 'hex'));
     if (userMatch && passMatch) {
       clearAttempts(ip);
-      const token = generateAdminToken();
+      const token = signToken();
       ctx.setCookie = { name: 'admin_token', value: token };
       return { success: true, isAdmin: true };
     }
@@ -224,7 +236,7 @@ const procedures = {
   },
 
   'admin.checkSession': (_input, ctx) => {
-    return { isAdmin: checkAdmin(ctx.cookies) };
+    return { isAdmin: checkAdmin(ctx.cookies) === true };
   },
 
   'admin.getApplications': (_input, ctx) => {
@@ -430,7 +442,7 @@ app.all('/api/trpc/:procedures', (req, res) => {
 
   if (ctx.setCookie) {
     res.cookie(ctx.setCookie.name, ctx.setCookie.value, {
-      httpOnly: true, path: '/', sameSite: 'lax', maxAge: 86400000,
+      httpOnly: true, path: '/', sameSite: 'lax', secure: true, maxAge: 86400000,
     });
   }
   if (ctx.clearCookie) {
