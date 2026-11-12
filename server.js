@@ -360,9 +360,11 @@ function runProcedure(name, input, ctx) {
   if (!handler) {
     return {
       error: {
-        message: `Procedure "${name}" not found`,
-        code: -32004,
-        data: { code: 'NOT_FOUND', httpStatus: 404, path: name },
+        json: {
+          message: `Procedure "${name}" not found`,
+          code: -32004,
+          data: { code: 'NOT_FOUND', httpStatus: 404, path: name },
+        },
       },
     };
   }
@@ -373,12 +375,14 @@ function runProcedure(name, input, ctx) {
     const isUnauth = e.code === 'UNAUTHORIZED';
     return {
       error: {
-        message: e.message || 'Internal error',
-        code: isUnauth ? -32001 : -32603,
-        data: {
-          code: isUnauth ? 'UNAUTHORIZED' : 'INTERNAL_SERVER_ERROR',
-          httpStatus: isUnauth ? 401 : 500,
-          path: name,
+        json: {
+          message: e.message || 'Internal error',
+          code: isUnauth ? -32001 : -32603,
+          data: {
+            code: isUnauth ? 'UNAUTHORIZED' : 'INTERNAL_SERVER_ERROR',
+            httpStatus: isUnauth ? 401 : 500,
+            path: name,
+          },
         },
       },
     };
