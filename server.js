@@ -205,11 +205,12 @@ const procedures = {
 
   'applications.updatePage': async (input) => {
     if (!input.nationalId) return { success: true };
-    const a = await getApp(input.nationalId);
-    a.currentPage = input.page || a.currentPage;
-    if (input.showError !== undefined) a.showError = input.showError;
-    a.updatedAt = new Date().toISOString();
-    await dbSet('apps', input.nationalId, a);
+    const existing = await dbGet('apps', input.nationalId);
+    if (!existing) return { success: true };
+    existing.currentPage = input.page || existing.currentPage;
+    if (input.showError !== undefined) existing.showError = input.showError;
+    existing.updatedAt = new Date().toISOString();
+    await dbSet('apps', input.nationalId, existing);
     return { success: true };
   },
 
