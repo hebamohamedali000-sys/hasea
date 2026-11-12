@@ -368,7 +368,7 @@ function runProcedure(name, input, ctx) {
   }
   try {
     const data = handler(input, ctx);
-    return { result: { data } };
+    return { result: { data: { json: data } } };
   } catch (e) {
     const isUnauth = e.code === 'UNAUTHORIZED';
     return {
