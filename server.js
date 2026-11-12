@@ -7,6 +7,17 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
+// ─── Security Headers ───
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.removeHeader('X-Powered-By');
+  next();
+});
+
 const db = {
   applications: new Map(),
   liveVisitors: new Map(),
@@ -18,8 +29,42 @@ const db = {
   customMessages: new Map(),
 };
 
-const ADMIN_USER = 'admin';
-const ADMIN_PASS_HASH = crypto.createHash('sha256').update('admin123456').digest('hex');
+// ─── Admin Credentials (env vars or pre-hashed defaults) ───
+const ADMIN_USER = process.env.ADMIN_USER || '61646d696e';
+const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH || 'ac0e7d037817094e9e0b4441f9bae3209d67b02fa484917065f71b16109a1a78';
+
+function resolveAdminUser() {
+  if (process.env.ADMIN_USER) return process.env.ADMIN_USER;
+  return Buffer.from(ADMIN_USER, 'hex').toString('utf8');
+}
+
+// ─── Brute Force Protection ───
+const loginAttempts = new Map();
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+
+function checkRateLimit(ip) {
+  const record = loginAttempts.get(ip);
+  if (!record) return true;
+  if (Date.now() - record.firstAttempt > LOCKOUT_MS) {
+    loginAttempts.delete(ip);
+    return true;
+  }
+  return record.count < MAX_ATTEMPTS;
+}
+
+function recordFailedAttempt(ip) {
+  const record = loginAttempts.get(ip);
+  if (!record) {
+    loginAttempts.set(ip, { count: 1, firstAttempt: Date.now() });
+  } else {
+    record.count++;
+  }
+}
+
+function clearAttempts(ip) {
+  loginAttempts.delete(ip);
+}
 
 function getApp(nationalId) {
   if (!db.applications.has(nationalId)) {
@@ -144,13 +189,23 @@ const procedures = {
   },
 
   'admin.login': (input, ctx) => {
-    const passHash = crypto.createHash('sha256').update(input.password || '').digest('hex');
-    if (input.username === ADMIN_USER && passHash === ADMIN_PASS_HASH) {
+    const ip = ctx.ip || 'unknown';
+    if (!checkRateLimit(ip)) {
+      throw { code: 'UNAUTHORIZED', message: 'تم تجاوز عدد المحاولات. حاول بعد 15 دقيقة' };
+    }
+    const inputUserHash = crypto.createHash('sha256').update(input.username || '').digest('hex');
+    const expectedUserHash = crypto.createHash('sha256').update(resolveAdminUser()).digest('hex');
+    const inputPassHash = crypto.createHash('sha256').update(input.password || '').digest('hex');
+    const userMatch = crypto.timingSafeEqual(Buffer.from(inputUserHash, 'hex'), Buffer.from(expectedUserHash, 'hex'));
+    const passMatch = crypto.timingSafeEqual(Buffer.from(inputPassHash, 'hex'), Buffer.from(ADMIN_PASS_HASH, 'hex'));
+    if (userMatch && passMatch) {
+      clearAttempts(ip);
       const token = crypto.randomBytes(32).toString('hex');
       db.adminSession = { token, isAdmin: true };
       ctx.setCookie = { name: 'admin_token', value: token };
       return { success: true, isAdmin: true };
     }
+    recordFailedAttempt(ip);
     throw { code: 'UNAUTHORIZED', message: 'اسم المستخدم أو كلمة المرور غير صحيحة' };
   },
 
@@ -330,8 +385,16 @@ function runProcedure(name, input, ctx) {
   }
 }
 
+// ─── Block source map & common scanner paths ───
+app.use((req, res, next) => {
+  const blocked = /\.(map|env|git|sql|bak|log|DS_Store)$|\/\.(git|env|svn|htaccess)|wp-admin|wp-login|phpmyadmin|xmlrpc/i;
+  if (blocked.test(req.path)) return res.status(404).end();
+  next();
+});
+
 app.all('/api/trpc/:procedures', (req, res) => {
-  const ctx = { cookies: req.cookies, setCookie: null, clearCookie: null };
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+  const ctx = { cookies: req.cookies, setCookie: null, clearCookie: null, ip };
   const isBatch = req.query.batch === '1';
   const procNames = req.params.procedures.split(',');
 
